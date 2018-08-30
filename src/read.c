@@ -35,6 +35,7 @@ MOBI_RET mobi_load_pdbheader(MOBIData *m, FILE *file) {
     }
     MOBIBuffer *buf = buffer_init(PALMDB_HEADER_LEN);
     if (buf == NULL) {
+        debug_print("%s\n", "Memory allocation failed");
         return MOBI_MALLOC_FAILED;
     }
     const size_t len = fread(buf->data, 1, PALMDB_HEADER_LEN, file);
@@ -45,6 +46,7 @@ MOBI_RET mobi_load_pdbheader(MOBIData *m, FILE *file) {
     m->ph = calloc(1, sizeof(MOBIPdbHeader));
     if (m->ph == NULL) {
         debug_print("%s", "Memory allocation for pdb header failed\n");
+        buffer_free(buf);
         return MOBI_MALLOC_FAILED;
     }
     /* parse header */
@@ -91,6 +93,7 @@ MOBI_RET mobi_load_reclist(MOBIData *m, FILE *file) {
     for (int i = 0; i < m->ph->rec_count; i++) {
         MOBIBuffer *buf = buffer_init(PALMDB_RECORD_INFO_SIZE);
         if (buf == NULL) {
+            debug_print("%s\n", "Memory allocation failed");
             return MOBI_MALLOC_FAILED;
         }
         const size_t len = fread(buf->data, 1, PALMDB_RECORD_INFO_SIZE, file);
@@ -102,6 +105,7 @@ MOBI_RET mobi_load_reclist(MOBIData *m, FILE *file) {
             curr->next = calloc(1, sizeof(MOBIPdbRecord));
             if (curr->next == NULL) {
                 debug_print("%s", "Memory allocation for pdb record failed\n");
+                buffer_free(buf);
                 return MOBI_MALLOC_FAILED;
             }
             curr = curr->next;
@@ -199,16 +203,18 @@ MOBI_RET mobi_parse_extheader(MOBIData *m, MOBIBuffer *buf) {
         return MOBI_INIT_FAILED;
     }
     char exth_magic[5];
+    const size_t header_length = 12;
     buffer_getstring(exth_magic, buf, 4);
-    const size_t exth_length = buffer_get32(buf);
+    const size_t exth_length = buffer_get32(buf) - header_length;
     const size_t rec_count = buffer_get32(buf);
     if (strncmp(exth_magic, EXTH_MAGIC, 4) != 0 ||
-        exth_length + buf->offset + 8 > buf->maxlen ||
-        rec_count == 0) {
+        exth_length + buf->offset > buf->maxlen ||
+        rec_count == 0 || rec_count > MOBI_EXTH_MAXCNT) {
+        debug_print("%s", "Sanity checks for EXTH header failed\n");
         return MOBI_DATA_CORRUPT;
     }
     const size_t saved_maxlen = buf->maxlen;
-    buf->maxlen = exth_length + buf->offset - 8;
+    buf->maxlen = exth_length + buf->offset;
     m->eh = calloc(1, sizeof(MOBIExthHeader));
     if (m->eh == NULL) {
         debug_print("%s", "Memory allocation for EXTH header failed\n");
@@ -216,10 +222,11 @@ MOBI_RET mobi_parse_extheader(MOBIData *m, MOBIBuffer *buf) {
     }
     MOBIExthHeader *curr = m->eh;
     for (size_t i = 0; i < rec_count; i++) {
-        if (i > 0) {
+        if (curr->data) {
             curr->next = calloc(1, sizeof(MOBIExthHeader));
             if (curr->next == NULL) {
                 debug_print("%s", "Memory allocation for EXTH header failed\n");
+                mobi_free_eh(m);
                 return MOBI_MALLOC_FAILED;
             }
             curr = curr->next;
@@ -230,6 +237,11 @@ MOBI_RET mobi_parse_extheader(MOBIData *m, MOBIBuffer *buf) {
         if (curr->size == 0) {
             debug_print("Skip record %i, data too short\n", curr->tag);
             continue;
+        }
+        if (buf->offset + curr->size > buf->maxlen) {
+            debug_print("Record %i too long\n", curr->tag);
+            mobi_free_eh(m);
+            return MOBI_DATA_CORRUPT;
         }
         curr->data = malloc(curr->size);
         if (curr->data == NULL) {
@@ -271,13 +283,35 @@ MOBI_RET mobi_parse_mobiheader(MOBIData *m, MOBIBuffer *buf) {
         return MOBI_DATA_CORRUPT;
     }
     const size_t saved_maxlen = buf->maxlen;
+    /* some old files declare zero length mobi header, try to read first 24 bytes anyway */
+    uint32_t header_length = (*m->mh->header_length > 0) ? *m->mh->header_length : 24;
     /* read only declared MOBI header length (curr offset minus 8 already read bytes) */
-    buf->maxlen = *m->mh->header_length + buf->offset - 8;
+    const size_t left_length = header_length + buf->offset - 8;
+    buf->maxlen = saved_maxlen < left_length ? saved_maxlen : left_length;
     buffer_dup32(&m->mh->mobi_type, buf);
-    buffer_dup32(&m->mh->text_encoding, buf);
+    uint32_t encoding = buffer_get32(buf);
+    if (encoding == 1252) {
+        m->mh->text_encoding = malloc(sizeof(MOBIEncoding));
+        if (m->mh->text_encoding == NULL) {
+            debug_print("%s", "Memory allocation for MOBI header failed\n");
+            return MOBI_MALLOC_FAILED;
+        }
+        *m->mh->text_encoding = MOBI_CP1252;
+    }
+    else if (encoding == 65001) {
+        m->mh->text_encoding = malloc(sizeof(MOBIEncoding));
+        if (m->mh->text_encoding == NULL) {
+            debug_print("%s", "Memory allocation for MOBI header failed\n");
+            return MOBI_MALLOC_FAILED;
+        }
+        *m->mh->text_encoding = MOBI_UTF8;
+    } else {
+        debug_print("Unknown encoding in mobi header: %i\n", encoding);
+    }
     buffer_dup32(&m->mh->uid, buf);
     buffer_dup32(&m->mh->version, buf);
-    if (m->mh->version && *m->mh->version == 8) {
+    if (header_length >= MOBI_HEADER_V7_SIZE
+        && m->mh->version && *m->mh->version == 8) {
         isKF8 = 1;
     }
     buffer_dup32(&m->mh->orth_index, buf);
@@ -303,13 +337,13 @@ MOBI_RET mobi_parse_mobiheader(MOBIData *m, MOBIBuffer *buf) {
     buffer_dup32(&m->mh->datp_rec_index, buf);
     buffer_dup32(&m->mh->datp_rec_count, buf);
     buffer_dup32(&m->mh->exth_flags, buf);
-    buf->offset += 32; /* 32 unknown bytes */
+    buffer_seek(buf, 32); /* 32 unknown bytes */
     buffer_dup32(&m->mh->unknown6, buf);
     buffer_dup32(&m->mh->drm_offset, buf);
     buffer_dup32(&m->mh->drm_count, buf);
     buffer_dup32(&m->mh->drm_size, buf);
     buffer_dup32(&m->mh->drm_flags, buf);
-    buf->offset += 8; /* 8 unknown bytes */
+    buffer_seek(buf, 8); /* 8 unknown bytes */
     if (isKF8) {
         buffer_dup32(&m->mh->fdst_index, buf);
     } else {
@@ -327,7 +361,7 @@ MOBI_RET mobi_parse_mobiheader(MOBIData *m, MOBIBuffer *buf) {
     buffer_dup32(&m->mh->srcs_count, buf);
     buffer_dup32(&m->mh->unknown12, buf);
     buffer_dup32(&m->mh->unknown13, buf);
-    buf->offset += 2; /* 2 byte fill */
+    buffer_seek(buf, 2); /* 2 byte fill */
     buffer_dup16(&m->mh->extra_flags, buf);
     buffer_dup32(&m->mh->ncx_index, buf);
     if (isKF8) {
@@ -349,9 +383,26 @@ MOBI_RET mobi_parse_mobiheader(MOBIData *m, MOBIBuffer *buf) {
     buffer_dup32(&m->mh->unknown20, buf);
     if (buf->maxlen > buf->offset) {
         debug_print("Skipping %zu unknown bytes in MOBI header\n", (buf->maxlen - buf->offset));
-        buf->offset = buf->maxlen;
+        buffer_setpos(buf, buf->maxlen);
     }
     buf->maxlen = saved_maxlen;
+    /* get full name stored at m->mh->full_name_offset */
+    if (m->mh->full_name_offset && m->mh->full_name_length) {
+        const size_t saved_offset = buf->offset;
+        const uint32_t full_name_length = min(*m->mh->full_name_length, MOBI_TITLE_SIZEMAX);
+        buffer_setpos(buf, *m->mh->full_name_offset);
+        m->mh->full_name = malloc(full_name_length + 1);
+        if (m->mh->full_name == NULL) {
+            debug_print("%s", "Memory allocation for full name failed\n");
+            return MOBI_MALLOC_FAILED;
+        }
+        if (full_name_length) {
+            buffer_getstring(m->mh->full_name, buf, full_name_length);
+        } else {
+            m->mh->full_name[0] = '\0';
+        }
+        buffer_setpos(buf, saved_offset);
+    }
     return MOBI_SUCCESS;
 }
 
@@ -379,11 +430,11 @@ MOBI_RET mobi_parse_record0(MOBIData *m, const size_t seqnumber) {
         debug_print("%s", "Record 0 too short\n");
         return MOBI_DATA_CORRUPT;
     }
-    MOBIBuffer *buf = buffer_init_null(record0->size);
+    MOBIBuffer *buf = buffer_init_null(record0->data, record0->size);
     if (buf == NULL) {
+        debug_print("%s\n", "Memory allocation failed");
         return MOBI_MALLOC_FAILED;
     }
-    buf->data = record0->data;
     m->rh = calloc(1, sizeof(MOBIRecord0Header));
     if (m->rh == NULL) {
         debug_print("%s", "Memory allocation for record 0 header failed\n");
@@ -392,7 +443,7 @@ MOBI_RET mobi_parse_record0(MOBIData *m, const size_t seqnumber) {
     }
     /* parse palmdoc header */
     const uint16_t compression = buffer_get16(buf);
-    buf->offset += 2; // unused 2 bytes, zeroes
+    buffer_seek(buf, 2); // unused 2 bytes, zeroes
     if ((compression != RECORD0_NO_COMPRESSION &&
          compression != RECORD0_PALMDOC_COMPRESSION &&
          compression != RECORD0_HUFF_COMPRESSION)) {
@@ -429,14 +480,13 @@ MOBI_RET mobi_parse_record0(MOBIData *m, const size_t seqnumber) {
  */
 size_t mobi_get_record_extrasize(const MOBIPdbRecord *record, const uint16_t flags) {
     size_t extra_size = 0;
-    MOBIBuffer *buf = buffer_init_null(record->size);
+    MOBIBuffer *buf = buffer_init_null(record->data, record->size);
     if (buf == NULL) {
         debug_print("%s", "Buffer init in extrasize failed\n");
         return MOBI_NOTSET;
     }
-    buf->data = record->data;
     /* set pointer at the end of the record data */
-    buf->offset = buf->maxlen - 1;
+    buffer_setpos(buf, buf->maxlen - 1);
     for (int bit = 15; bit > 0; bit--) {
         if (flags & (1 << bit)) {
             /* bit is set */
@@ -445,7 +495,7 @@ size_t mobi_get_record_extrasize(const MOBIPdbRecord *record, const uint16_t fla
             const uint32_t size = buffer_get_varlen_dec(buf, &len);
             /* skip data */
             /* TODO: read and store in record struct */
-            buf->offset -= (size - len);
+            buffer_seek(buf, - (int)(size - len));
             extra_size += size;
         }
     };
@@ -454,9 +504,45 @@ size_t mobi_get_record_extrasize(const MOBIPdbRecord *record, const uint16_t fla
             const uint8_t b = buffer_get8(buf);
             /* two first bits hold size */
             extra_size += (b & 0x3) + 1;
-        
     }
     buffer_free_null(buf);
+    return extra_size;
+}
+
+/**
+ @brief Calculate the size of extra multibyte section at the end of text record
+ 
+ @param[in] record MOBIPdbRecord structure containing the record
+ @param[in] flags Flags from MOBI header (extra_flags)
+ @return The size of trailing bytes, MOBI_NOTSET on failure
+ */
+size_t mobi_get_record_mb_extrasize(const MOBIPdbRecord *record, const uint16_t flags) {
+    size_t extra_size = 0;
+    if (flags & 1) {
+        MOBIBuffer *buf = buffer_init_null(record->data, record->size);
+        if (buf == NULL) {
+            debug_print("%s", "Buffer init in extrasize failed\n");
+            return MOBI_NOTSET;
+        }
+        /* set pointer at the end of the record data */
+        buffer_setpos(buf, buf->maxlen - 1);
+        for (int bit = 15; bit > 0; bit--) {
+            if (flags & (1 << bit)) {
+                /* bit is set */
+                size_t len = 0;
+                /* size contains varlen itself and optional data */
+                const uint32_t size = buffer_get_varlen_dec(buf, &len);
+                /* skip data */
+                /* TODO: read and store in record struct */
+                buffer_seek(buf, - (int)(size - len));
+            }
+        };
+        /* read multibyte section */
+        const uint8_t b = buffer_get8(buf);
+        /* two first bits hold size */
+        extra_size += (b & 0x3) + 1;
+        buffer_free_null(buf);
+    }
     return extra_size;
 }
 
@@ -468,11 +554,11 @@ size_t mobi_get_record_extrasize(const MOBIPdbRecord *record, const uint16_t fla
  @return MOBI_RET status code (on success MOBI_SUCCESS)
  */
 MOBI_RET mobi_parse_huff(MOBIHuffCdic *huffcdic, const MOBIPdbRecord *record) {
-    MOBIBuffer *buf = buffer_init_null(record->size);
+    MOBIBuffer *buf = buffer_init_null(record->data, record->size);
     if (buf == NULL) {
+        debug_print("%s\n", "Memory allocation failed");
         return MOBI_MALLOC_FAILED;
     }
-    buf->data = record->data;
     char huff_magic[5];
     buffer_getstring(huff_magic, buf, 4);
     const size_t header_length = buffer_get32(buf);
@@ -484,7 +570,7 @@ MOBI_RET mobi_parse_huff(MOBIHuffCdic *huffcdic, const MOBIPdbRecord *record) {
     const size_t data1_offset = buffer_get32(buf);
     const size_t data2_offset = buffer_get32(buf);
     /* skip little-endian table offsets */
-    buf->offset = data1_offset;
+    buffer_setpos(buf, data1_offset);
     if (buf->offset + (256 * 4) > buf->maxlen) {
         debug_print("%s", "HUFF data1 too short\n");
         buffer_free_null(buf);
@@ -494,7 +580,7 @@ MOBI_RET mobi_parse_huff(MOBIHuffCdic *huffcdic, const MOBIPdbRecord *record) {
     for (int i = 0; i < 256; i++) {
         huffcdic->table1[i] = buffer_get32(buf);
     }
-    buf->offset = data2_offset;
+    buffer_setpos(buf, data2_offset);
     if (buf->offset + (64 * 4) > buf->maxlen) {
         debug_print("%s", "HUFF data2 too short\n");
         buffer_free_null(buf);
@@ -522,11 +608,11 @@ MOBI_RET mobi_parse_huff(MOBIHuffCdic *huffcdic, const MOBIPdbRecord *record) {
  @return MOBI_RET status code (on success MOBI_SUCCESS)
  */
 MOBI_RET mobi_parse_cdic(MOBIHuffCdic *huffcdic, const MOBIPdbRecord *record, const size_t num) {
-    MOBIBuffer *buf = buffer_init_null(record->size);
+    MOBIBuffer *buf = buffer_init_null(record->data, record->size);
     if (buf == NULL) {
+        debug_print("%s\n", "Memory allocation failed");
         return MOBI_MALLOC_FAILED;
     }
-    buf->data = record->data;
     char cdic_magic[5];
     buffer_getstring(cdic_magic, buf, 4);
     const size_t header_length = buffer_get32(buf);
@@ -540,10 +626,19 @@ MOBI_RET mobi_parse_cdic(MOBIHuffCdic *huffcdic, const MOBIPdbRecord *record, co
     size_t index_count = buffer_get32(buf);
     const size_t code_length = buffer_get32(buf);
     if (huffcdic->code_length && huffcdic->code_length != code_length) {
-        debug_print("Warning: CDIC different code length %zu in record %i, previous was %zu\n", huffcdic->code_length, record->uid, code_length);
+        debug_print("CDIC different code length %zu in record %i, previous was %zu\n", huffcdic->code_length, record->uid, code_length);
+        buffer_free_null(buf);
+        return MOBI_DATA_CORRUPT;
     }
     if (huffcdic->index_count && huffcdic->index_count != index_count) {
-        debug_print("Warning: CDIC different index count %zu in record %i, previous was %zu\n", huffcdic->index_count, record->uid, index_count);
+        debug_print("CDIC different index count %zu in record %i, previous was %zu\n", huffcdic->index_count, record->uid, index_count);
+        buffer_free_null(buf);
+        return MOBI_DATA_CORRUPT;
+    }
+    if (code_length == 0 || code_length > HUFF_CODELEN_MAX) {
+        debug_print("Code length exceeds sanity checks (%zu)\n", code_length);
+        buffer_free_null(buf);
+        return MOBI_DATA_CORRUPT;
     }
     huffcdic->code_length = code_length;
     huffcdic->index_count = index_count;
@@ -554,6 +649,11 @@ MOBI_RET mobi_parse_cdic(MOBIHuffCdic *huffcdic, const MOBIPdbRecord *record, co
     }
     /* allocate memory for symbol offsets if not already allocated */
     if (num == 0) {
+        if (index_count > (1 << HUFF_CODELEN_MAX) * CDIC_RECORD_MAXCNT) {
+            debug_print("CDIC index count too large %zu\n", index_count);
+            buffer_free_null(buf);
+            return MOBI_DATA_CORRUPT;
+        }
         huffcdic->symbol_offsets = malloc(index_count * sizeof(*huffcdic->symbol_offsets));
         if (huffcdic->symbol_offsets == NULL) {
             debug_print("%s", "CDIC cannot allocate memory");
@@ -568,7 +668,6 @@ MOBI_RET mobi_parse_cdic(MOBIHuffCdic *huffcdic, const MOBIPdbRecord *record, co
     }
     if (buf->offset + (index_count * 2) > buf->maxlen) {
         debug_print("%s", "CDIC indices data too short\n");
-        free(huffcdic->symbol_offsets);
         buffer_free_null(buf);
         return MOBI_DATA_CORRUPT;
     }
@@ -578,7 +677,6 @@ MOBI_RET mobi_parse_cdic(MOBIHuffCdic *huffcdic, const MOBIPdbRecord *record, co
     }
     if (buf->offset + code_length > buf->maxlen) {
         debug_print("%s", "CDIC dictionary data too short\n");
-        free(huffcdic->symbol_offsets);
         buffer_free_null(buf);
         return MOBI_DATA_CORRUPT;
     }
@@ -599,15 +697,19 @@ MOBI_RET mobi_parse_cdic(MOBIHuffCdic *huffcdic, const MOBIPdbRecord *record, co
 MOBI_RET mobi_parse_huffdic(const MOBIData *m, MOBIHuffCdic *huffcdic) {
     MOBI_RET ret;
     const size_t offset = mobi_get_kf8offset(m);
-    if (m->mh == NULL || m->mh->huff_rec_index == NULL) {
+    if (m->mh == NULL || m->mh->huff_rec_index == NULL || m->mh->huff_rec_count == NULL) {
         debug_print("%s", "HUFF/CDIC records metadata not found in MOBI header\n");
         return MOBI_DATA_CORRUPT;
     }
     const size_t huff_rec_index = *m->mh->huff_rec_index + offset;
     const size_t huff_rec_count = *m->mh->huff_rec_count;
+    if (huff_rec_count > HUFF_RECORD_MAXCNT) {
+        debug_print("Too many HUFF record (%zu)\n", huff_rec_count);
+        return MOBI_DATA_CORRUPT;
+    }
     const MOBIPdbRecord *curr = mobi_get_record_by_seqnumber(m, huff_rec_index);
-    if (curr == NULL) {
-        debug_print("%s", "HUFF record not found\n");
+    if (curr == NULL || huff_rec_count < 2) {
+        debug_print("%s", "HUFF/CDIC record not found\n");
         return MOBI_DATA_CORRUPT;
     }
     if (curr->size < HUFF_RECORD_MINSIZE) {
@@ -622,13 +724,20 @@ MOBI_RET mobi_parse_huffdic(const MOBIData *m, MOBIHuffCdic *huffcdic) {
     curr = curr->next;
     /* allocate memory for symbols data in each CDIC record */
     huffcdic->symbols = malloc((huff_rec_count - 1) * sizeof(*huffcdic->symbols));
+    if (huffcdic->symbols == NULL) {
+        debug_print("%s\n", "Memory allocation failed");
+        return MOBI_MALLOC_FAILED;
+    }
     /* get following CDIC records */
     size_t i = 0;
     while (i < huff_rec_count - 1) {
+        if (curr == NULL) {
+            debug_print("%s\n", "CDIC record not found");
+            return MOBI_DATA_CORRUPT;
+        }
         ret = mobi_parse_cdic(huffcdic, curr, i++);
         if (ret != MOBI_SUCCESS) {
             debug_print("%s", "CDIC parsing failed\n");
-            free(huffcdic->symbols);
             return ret;
         }
         curr = curr->next;
@@ -653,11 +762,14 @@ MOBI_RET mobi_parse_fdst(const MOBIData *m, MOBIRawml *rawml) {
         return MOBI_DATA_CORRUPT;
     }
     const MOBIPdbRecord *fdst_record = mobi_get_record_by_seqnumber(m, fdst_record_number);
-    MOBIBuffer *buf = buffer_init_null(fdst_record->size);
+    if (fdst_record == NULL) {
+        return MOBI_DATA_CORRUPT;
+    }
+    MOBIBuffer *buf = buffer_init_null(fdst_record->data, fdst_record->size);
     if (buf == NULL) {
+        debug_print("%s\n", "Memory allocation failed");
         return MOBI_MALLOC_FAILED;
     }
-    buf->data = fdst_record->data;
     char fdst_magic[5];
     buffer_getstring(fdst_magic, buf, 4);
     const size_t data_offset = buffer_get32(buf);
@@ -676,9 +788,29 @@ MOBI_RET mobi_parse_fdst(const MOBIData *m, MOBIRawml *rawml) {
         return MOBI_DATA_CORRUPT;
     }
     rawml->fdst = malloc(sizeof(MOBIFdst));
+    if (rawml->fdst == NULL) {
+        debug_print("%s\n", "Memory allocation failed");
+        buffer_free_null(buf);
+        return MOBI_MALLOC_FAILED;
+    }
     rawml->fdst->fdst_section_count = section_count;
-    rawml->fdst->fdst_section_starts = malloc(sizeof(uint32_t) * section_count);
-    rawml->fdst->fdst_section_ends = malloc(sizeof(uint32_t) * section_count);
+    rawml->fdst->fdst_section_starts = malloc(sizeof(*rawml->fdst->fdst_section_starts) * section_count);
+    if (rawml->fdst->fdst_section_starts == NULL) {
+        debug_print("%s\n", "Memory allocation failed");
+        buffer_free_null(buf);
+        free(rawml->fdst);
+        rawml->fdst = NULL;
+        return MOBI_MALLOC_FAILED;
+    }
+    rawml->fdst->fdst_section_ends = malloc(sizeof(*rawml->fdst->fdst_section_ends) * section_count);
+    if (rawml->fdst->fdst_section_ends == NULL) {
+        debug_print("%s\n", "Memory allocation failed");
+        buffer_free_null(buf);
+        free(rawml->fdst->fdst_section_starts);
+        free(rawml->fdst);
+        rawml->fdst = NULL;
+        return MOBI_MALLOC_FAILED;
+    }
     size_t i = 0;
     while (i < section_count) {
         rawml->fdst->fdst_section_starts[i] = buffer_get32(buf);
@@ -727,8 +859,13 @@ MOBI_RET mobi_load_file(MOBIData *m, FILE *file) {
     if (ret != MOBI_SUCCESS) {
         return ret;
     }
-    /* if EXTH is loaded and use_kf8 flag is set parse KF8 record0 for hybrid KF7/KF8 file */
-    if (m->eh && m->use_kf8) {
+    if (m->rh && m->rh->encryption_type == RECORD0_OLD_ENCRYPTION) {
+        /* try to set key for encryption type 1 */
+        debug_print("Trying to set key for encryption type 1%s", "\n")
+        mobi_drm_setkey(m, NULL);
+    }
+    /* if EXTH is loaded parse KF8 record0 for hybrid KF7/KF8 file */
+    if (m->eh) {
         const size_t boundary_rec_number = mobi_get_kf8boundary_seqnumber(m);
         if (boundary_rec_number != MOBI_NOTSET && boundary_rec_number < UINT32_MAX) {
             /* it is a hybrid KF7/KF8 file */
@@ -737,13 +874,17 @@ MOBI_RET mobi_load_file(MOBIData *m, FILE *file) {
             /* link pdb header and records data to KF8data structure */
             m->next->ph = m->ph;
             m->next->rec = m->rec;
+            m->next->drm_key = m->drm_key;
             /* close next loop */
             m->next->next = m;
             ret = mobi_parse_record0(m->next, boundary_rec_number + 1);
             if (ret != MOBI_SUCCESS) {
                 return ret;
             }
-            mobi_swap_mobidata(m);
+            /* swap to kf8 part if use_kf8 flag is set */
+            if (m->use_kf8) {
+                mobi_swap_mobidata(m);
+            }
         }
     }
     return MOBI_SUCCESS;

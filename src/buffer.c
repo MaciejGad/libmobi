@@ -24,18 +24,36 @@
  @return MOBIBuffer on success, NULL otherwise
  */
 MOBIBuffer * buffer_init(const size_t len) {
-    MOBIBuffer *buf = NULL;
-    buf = malloc(sizeof(MOBIBuffer));
+    unsigned char *data = malloc(len);
+    if (data == NULL) {
+        debug_print("%s", "Buffer data allocation failed\n");
+        return NULL;
+    }
+    MOBIBuffer *buf = buffer_init_null(data, len);
+    if (buf == NULL) {
+        free(data);
+    }
+    return buf;
+}
+
+/**
+ @brief Initializer for MOBIBuffer structure
+ 
+ It allocates memory for structure but, unlike buffer_init(), it does not allocate memory for data.
+ Instead it works on external data.
+ Memory should be freed with buffer_free_null() (buf->data will not be deallocated).
+ 
+ @param[in,out] data Set data as buffer data
+ @param[in] len Size of data held by the buffer
+ @return MOBIBuffer on success, NULL otherwise
+ */
+MOBIBuffer * buffer_init_null(unsigned char *data, const size_t len) {
+    MOBIBuffer *buf = malloc(sizeof(MOBIBuffer));
 	if (buf == NULL) {
         debug_print("%s", "Buffer allocation failed\n");
         return NULL;
     }
-    buf->data = malloc(len);
-	if (buf->data == NULL) {
-		free(buf);
-        debug_print("%s", "Buffer data allocation failed\n");
-		return NULL;
-	}
+    buf->data = data;
 	buf->offset = 0;
 	buf->maxlen = len;
     buf->error = MOBI_SUCCESS;
@@ -43,26 +61,27 @@ MOBIBuffer * buffer_init(const size_t len) {
 }
 
 /**
- @brief Initializer for MOBIBuffer structure
+ @brief Resize buffer
  
- It allocates memory for structure but, unlike buffer_init(), it does not allocate memory for data.
- Memory should be freed with buffer_free_null().
+ Smaller size than offset will cause data truncation.
  
- @param[in] len Size of data held by the buffer
- @return MOBIBuffer on success, NULL otherwise
+ @param[in,out] buf MOBIBuffer structure to be filled with data
+ @param[in] newlen New buffer size
  */
-MOBIBuffer * buffer_init_null(const size_t len) {
-    MOBIBuffer *buf = NULL;
-    buf = malloc(sizeof(MOBIBuffer));
-	if (buf == NULL) {
+void buffer_resize(MOBIBuffer *buf, const size_t newlen) {
+    unsigned char *tmp = realloc(buf->data, newlen);
+    if (tmp == NULL) {
         debug_print("%s", "Buffer allocation failed\n");
-        return NULL;
+        buf->error = MOBI_MALLOC_FAILED;
+        return;
     }
-    buf->data = NULL;
-	buf->offset = 0;
-	buf->maxlen = len;
+    buf->data = tmp;
+    buf->maxlen = newlen;
+    if (buf->offset >= newlen) {
+        buf->offset = newlen - 1;
+    }
+    debug_print("Buffer successfully resized to %zu\n", newlen);
     buf->error = MOBI_SUCCESS;
-	return buf;
 }
 
 /**
@@ -77,7 +96,7 @@ void buffer_add8(MOBIBuffer *buf, const uint8_t data) {
         buf->error = MOBI_BUFFER_END;
         return;
     }
-	buf->data[buf->offset++] = data;
+    buf->data[buf->offset++] = data;
 }
 
 /**
@@ -111,8 +130,8 @@ void buffer_add32(MOBIBuffer *buf, const uint32_t data) {
         return;
     }
     unsigned char *buftr = buf->data + buf->offset;
-    *buftr++ = (uint8_t)((uint32_t)(data & 0xff000000U) >> 16);
-    *buftr++ = (uint8_t)((uint32_t)(data & 0xff0000U) >> 12);
+    *buftr++ = (uint8_t)((uint32_t)(data & 0xff000000U) >> 24);
+    *buftr++ = (uint8_t)((uint32_t)(data & 0xff0000U) >> 16);
     *buftr++ = (uint8_t)((uint32_t)(data & 0xff00U) >> 8);
     *buftr = (uint8_t)((uint32_t)(data & 0xffU));
     buf->offset += 4;
@@ -136,7 +155,7 @@ void buffer_addraw(MOBIBuffer *buf, const unsigned char* data, const size_t len)
 }
 
 /**
- @brief Adds zero padded string to MOBIBuffer
+ @brief Adds string to MOBIBuffer without null terminator
  
  @param[in,out] buf MOBIBuffer structure to be filled with data
  @param[in] str Pointer to string
@@ -231,8 +250,9 @@ static uint32_t _buffer_get_varlen(MOBIBuffer *buf, size_t *len, const int direc
     uint32_t val = 0;
     uint8_t byte_count = 0;
     uint8_t byte;
-    uint8_t stop_flag = 0x80U;
-    uint8_t mask = 0x7fU;
+    const uint8_t stop_flag = 0x80;
+    const uint8_t mask = 0x7f;
+    uint32_t shift = 0;
     do {
         if (direction == 1) {
             if (buf->offset + 1 > buf->maxlen) {
@@ -241,6 +261,8 @@ static uint32_t _buffer_get_varlen(MOBIBuffer *buf, size_t *len, const int direc
                 return val;
             }
             byte = buf->data[buf->offset++];
+            val <<= 7;
+            val |= (byte & mask);
         } else {
             if (buf->offset < 1) {
                 debug_print("%s", "End of buffer\n");
@@ -248,9 +270,9 @@ static uint32_t _buffer_get_varlen(MOBIBuffer *buf, size_t *len, const int direc
                 return val;
             }
             byte = buf->data[buf->offset--];
-        }
-        val <<= 7;
-        val |= (byte & mask);
+            val = val | (uint32_t)(byte & mask) << shift;
+            shift += 7;
+        }        
         (*len)++;
         byte_count++;
     } while (!(byte & stop_flag) && (byte_count < 4));
@@ -298,6 +320,7 @@ void buffer_getstring(char *str, MOBIBuffer *buf, const size_t len) {
     if (buf->offset + len > buf->maxlen) {
         debug_print("%s", "End of buffer\n");
         buf->error = MOBI_BUFFER_END;
+        str[0] = '\0';
         return;
     }
     memcpy(str, buf->data + buf->offset, len);
@@ -347,6 +370,23 @@ void buffer_getraw(void *data, MOBIBuffer *buf, const size_t len) {
     }
     memcpy(data, buf->data + buf->offset, len);
     buf->offset += len;
+}
+
+/**
+ @brief Get pointer to MOBIBuffer data at offset
+ 
+ @param[in] buf MOBIBuffer structure containing data
+ @param[in] len Check if requested length is available in buffer
+ @return Pointer to offset, or NULL on failure
+ */
+unsigned char * buffer_getpointer(MOBIBuffer *buf, const size_t len) {
+    if (buf->offset + len > buf->maxlen) {
+        debug_print("%s", "End of buffer\n");
+        buf->error = MOBI_BUFFER_END;
+        return NULL;
+    }
+    buf->offset += len;
+    return buf->data + buf->offset - len;
 }
 
 /**
@@ -448,6 +488,46 @@ void buffer_copy(MOBIBuffer *dest, MOBIBuffer *source, const size_t len) {
     source->offset += len;
 }
 
+/**
+ @brief Copy raw value within one MOBIBuffer
+ 
+ Memmove len bytes from offset (relative to current position)
+ to current position in buffer and advance buffer position.
+ Data may overlap.
+ 
+ @param[out] buf Buffer
+ @param[in] offset Offset to read from
+ @param[in] len Number of bytes to copy
+ */
+void buffer_move(MOBIBuffer *buf, const int offset, const size_t len) {
+    size_t aoffset = (size_t) abs(offset);
+    unsigned char *source = buf->data + buf->offset;
+    if (offset >= 0) {
+        if (buf->offset + aoffset + len > buf->maxlen) {
+            debug_print("%s", "End of buffer\n");
+            buf->error = MOBI_BUFFER_END;
+            return;
+        }
+        source += aoffset;
+    } else {
+        if (buf->offset < aoffset) {
+            debug_print("%s", "End of buffer\n");
+            buf->error = MOBI_BUFFER_END;
+            return;
+        }
+        source -= aoffset;
+    }
+    memmove(buf->data + buf->offset, source, len);
+    buf->offset += len;
+}
+
+/**
+ @brief Check if buffer data header contains magic signature
+ 
+ @param[in] buf MOBIBuffer buffer containing data
+ @param[in] magic Magic signature
+ @return boolean true on match, false otherwise
+ */
 bool buffer_match_magic(MOBIBuffer *buf, const char *magic) {
     const size_t magic_length = strlen(magic);
     if (buf->offset + magic_length > buf->maxlen) {
@@ -457,6 +537,63 @@ bool buffer_match_magic(MOBIBuffer *buf, const char *magic) {
         return true;
     }
     return false;
+}
+
+/**
+ @brief Check if buffer contains magic signature at given offset
+ 
+ @param[in] buf MOBIBuffer buffer containing data
+ @param[in] magic Magic signature
+ @param[in] offset Offset
+ @return boolean true on match, false otherwise
+ */
+bool buffer_match_magic_offset(MOBIBuffer *buf, const char *magic, const size_t offset) {
+    bool match = false;
+    if (offset <= buf->maxlen) {
+        const size_t save_offset = buf->offset;
+        buf->offset = offset;
+        match = buffer_match_magic(buf, magic);
+        buf->offset = save_offset;
+    }
+    return match;
+}
+
+/**
+ @brief Move current buffer offset by diff bytes
+ 
+ @param[in,out] buf MOBIBuffer buffer containing data
+ @param[in] diff Number of bytes by which the offset is adjusted
+ */
+void buffer_seek(MOBIBuffer *buf, const int diff) {
+    size_t adiff = (size_t) abs(diff);
+    if (diff >= 0) {
+        if (buf->offset + adiff <= buf->maxlen) {
+            buf->offset += adiff;
+            return;
+        }
+    } else {
+        if (buf->offset >= adiff) {
+            buf->offset -= adiff;
+            return;
+        }
+    }
+    buf->error = MOBI_BUFFER_END;
+    debug_print("%s", "End of buffer\n");
+}
+
+/**
+ @brief Set buffer offset to pos position
+ 
+ @param[in,out] buf MOBIBuffer buffer containing data
+ @param[in] pos New position
+ */
+void buffer_setpos(MOBIBuffer *buf, const size_t pos) {
+    if (pos <= buf->maxlen) {
+        buf->offset = pos;
+        return;
+    }
+    buf->error = MOBI_BUFFER_END;
+    debug_print("%s", "End of buffer\n");
 }
 
 /**
@@ -485,129 +622,4 @@ void buffer_free(MOBIBuffer *buf) {
 void buffer_free_null(MOBIBuffer *buf) {
 	if (buf == NULL) { return; }
 	free(buf);
-}
-
-
-
-/**
- @brief Initializer for MOBIArray structure
- 
- It allocates memory for structure and for data: array of size_t variables.
- Memory should be freed with array_free().
- 
- @param[in] len Initial size of the array
- @return MOBIArray on success, NULL otherwise
- */
-MOBIArray * array_init(const size_t len) {
-    MOBIArray *arr = NULL;
-    arr = malloc(sizeof(MOBIArray));
-    if (arr == NULL) {
-        debug_print("%s", "Array allocation failed\n");
-        return NULL;
-    }
-    arr->data = malloc(len * sizeof(uint32_t));
-	if (arr->data == NULL) {
-		free(arr);
-        debug_print("%s", "Array data allocation failed\n");
-		return NULL;
-	}
-    arr->maxsize = arr->step = len;
-    arr->size = 0;
-    return arr;
-}
-
-/**
- @brief Initializer for MOBIBuffer structure
- 
- It allocates memory for structure and for data.
- Memory should be freed with buffer_free().
- 
- @param[in,out] arr MOBIArray array
- @param[in] value Value to be inserted
- @return MOBI_RET status code (on success MOBI_SUCCESS)
- */
-MOBI_RET array_insert(MOBIArray *arr, const uint32_t value) {
-    if (!arr || arr->maxsize == 0) {
-        return MOBI_INIT_FAILED;
-    }
-    if (arr->maxsize == arr->size) {
-        arr->maxsize += arr->step;
-        uint32_t *tmp = realloc(arr->data, arr->maxsize * sizeof(uint32_t));
-        if (!tmp) {
-            free(arr->data);
-            arr->data = NULL;
-            return MOBI_MALLOC_FAILED;
-        }
-        arr->data = tmp;
-    }
-    arr->data[arr->size] = value;
-    arr->size++;
-    return MOBI_SUCCESS;
-}
-
-/**
- @brief Helper for qsort in array_sort() function.
- 
- @param[in] a First element to compare
- @param[in] b Second element to compare
- @return -1 if a < b; 1 if a > b; 0 if a = b
- */
-static int array_compare(const void *a, const void *b) {
-    if (*(uint32_t *) a < *(uint32_t *) b) {
-        return -1;
-    };
-    if (*(uint32_t *) a > *(uint32_t *) b) {
-        return 1;
-    };
-    return 0;
-}
-
-/**
- @brief Sort MOBIArray in ascending order.
- 
- When unique is set to true, duplicate values are discarded.
- 
- @param[in,out] arr MOBIArray array
- @param[in] unique Discard duplicate values if true
- */
-void array_sort(MOBIArray *arr, const bool unique) {
-    if (!arr || !arr->data || arr->size == 0) {
-        return;
-    }
-    qsort(arr->data, arr->size, sizeof(uint32_t), array_compare);
-    if (unique) {
-        size_t i = 1, j = 1;
-        while (i < arr->size) {
-            if (arr->data[j - 1] == arr->data[i]) {
-                i++;
-                continue;
-            }
-            arr->data[j++] = arr->data[i++];
-        }
-        arr->size = j;
-    }
-}
-
-/**
- @brief Get size of the array
- 
- @param[in] arr MOBIArray structure
- */
-size_t array_size(MOBIArray *arr) {
-    return arr->size;
-}
-
-/**
- @brief Free MOBIArray structure and contained data
- 
- Free data initialized with array_init();
- 
- @param[in] arr MOBIArray structure
- */
-void array_free(MOBIArray *arr) {
-    if (!arr) { return; }
-    if (arr->data) {
-        free(arr->data);
-    }
-    free(arr);
 }

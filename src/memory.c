@@ -28,6 +28,7 @@ MOBIData * mobi_init(void) {
 	if (m == NULL) return NULL;
     m->use_kf8 = true;
     m->kf8_boundary_offset = MOBI_NOTSET;
+    m->drm_key = NULL;
     m->ph = NULL;
     m->rh = NULL;
     m->mh = NULL;
@@ -107,6 +108,7 @@ void mobi_free_mh(MOBIMobiHeader *mh) {
     free(mh->unknown18);
     free(mh->unknown19);
     free(mh->unknown20);
+    free(mh->full_name);
     free(mh);
     mh = NULL;
 }
@@ -172,6 +174,9 @@ void mobi_free(MOBIData *m) {
         free(m->next);
         m->next = NULL;
     }
+    if (m->drm_key) {
+        free(m->drm_key);
+    }
     free(m);
     m = NULL;
 }
@@ -232,6 +237,8 @@ MOBIRawml * mobi_init_rawml(const MOBIData *m) {
     rawml->frag = NULL;
     rawml->guide = NULL;
     rawml->ncx = NULL;
+    rawml->orth = NULL;
+    rawml->infl = NULL;
     rawml->flow = NULL;
     rawml->markup = NULL;
     rawml->resources = NULL;
@@ -271,6 +278,7 @@ MOBIIndx * mobi_init_indx(void) {
     }
     indx->entries = NULL;
     indx->cncx_record = NULL;
+    indx->orth_index_name = NULL;
     return indx;
 }
 
@@ -287,6 +295,10 @@ void mobi_free_index_entries(MOBIIndx *indx) {
     while (i < indx->entries_count) {
         free(indx->entries[i].label);
         if (indx->entries[i].tags != NULL) {
+            size_t j = 0;
+            while (j < indx->entries[i].tags_count) {
+                free(indx->entries[i].tags[j++].tagvalues);
+            }
             free(indx->entries[i].tags);
         }
         i++;
@@ -305,8 +317,40 @@ void mobi_free_indx(MOBIIndx *indx) {
         return;
     }
     mobi_free_index_entries(indx);
+    if (indx->orth_index_name) {
+        free(indx->orth_index_name);
+    }
     free(indx);
     indx = NULL;
+}
+
+/**
+ @brief Free MOBITagx structure and all its children
+ 
+ @param[in] tagx MOBITagx structure
+ */
+void mobi_free_tagx(MOBITagx *tagx) {
+    if (tagx == NULL) {
+        return;
+    }
+    free(tagx->tags);
+    free(tagx);
+    tagx = NULL;
+}
+
+/**
+ @brief Free MOBIOrdt structure and all its children
+ 
+ @param[in] ordt MOBIOrdt structure
+ */
+void mobi_free_ordt(MOBIOrdt *ordt) {
+    if (ordt == NULL) {
+        return;
+    }
+    free(ordt->ordt1);
+    free(ordt->ordt2);
+    free(ordt);
+    ordt = NULL;
 }
 
 /**
@@ -376,6 +420,8 @@ void mobi_free_rawml(MOBIRawml *rawml) {
     mobi_free_indx(rawml->frag);
     mobi_free_indx(rawml->guide);
     mobi_free_indx(rawml->ncx);
+    mobi_free_indx(rawml->orth);
+    mobi_free_indx(rawml->infl);
     mobi_free_part(rawml->flow, true);
     mobi_free_part(rawml->markup,true);
     /* do not free resources data, these are links to records data */

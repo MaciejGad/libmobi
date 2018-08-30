@@ -24,9 +24,17 @@
 /** @brief Visibility attributes for symbol export */
 #if defined (__CYGWIN__) || defined (__MINGW32__)
 #define MOBI_EXPORT __attribute__((visibility("default"))) __declspec(dllexport) extern
+#elif defined (_WIN32)
+#define MOBI_EXPORT __declspec(dllexport)
 #else
 #define MOBI_EXPORT __attribute__((__visibility__("default")))
 #endif
+
+/** 
+ @brief Usually 32-bit values in mobi records
+ with value 0xffffffff mean "value not set"
+ */
+#define MOBI_NOTSET UINT32_MAX
 
 #ifdef __cplusplus
 extern "C"
@@ -51,7 +59,11 @@ extern "C"
         MOBI_MALLOC_FAILED = 7, /**< Memory allocation error */
         MOBI_INIT_FAILED = 8, /**< Initialization error */
         MOBI_BUFFER_END = 9, /**< Out of buffer error */
-        MOBI_XML_ERR = 10, /**< LibXML2 error */
+        MOBI_XML_ERR = 10, /**< XMLwriter error */
+        MOBI_DRM_PIDINV = 11,  /**< Invalid DRM PID */
+        MOBI_DRM_KEYNOTFOUND = 12,  /**< Key not found */
+        MOBI_DRM_UNSUPPORTED = 13, /**< DRM support not included */
+        MOBI_WRITE_FAILED = 14, /**< Writing to file failed */
     } MOBI_RET;
     
     /**
@@ -138,10 +150,13 @@ extern "C"
         EXTH_PUBLISHERFILEAS = 522,
         EXTH_LANGUAGE = 524, /**< <dc:language> */
         EXTH_ALIGNMENT = 525, /**< <primary-writing-mode> */
+        EXTH_CREATORSTRING = 526,
         EXTH_PAGEDIR = 527,
         EXTH_OVERRIDEFONTS = 528, /**< <override-kindle-fonts> */
         EXTH_SORCEDESC = 529,
-        EXTH_UNK534 = 534,
+        EXTH_DICTLANGIN = 531,
+        EXTH_DICTLANGOUT = 532,
+        EXTH_INPUTSOURCE = 534,
         EXTH_CREATORBUILDREV = 535,
     } MOBIExthTag;
     
@@ -187,23 +202,20 @@ extern "C"
     /** @} */
     
     /**
+     @defgroup mobi_enc Encoding types in MOBI header (offset 28)
+     @{
+     */
+    typedef enum {
+        MOBI_CP1252 = 1252, /**< cp-1252 encoding */
+        MOBI_UTF8 = 65001, /**< utf-8 encoding */
+        MOBI_UTF16 = 65002, /**< utf-16 encoding */
+    } MOBIEncoding;
+    /** @} */
+    
+    /**
      @defgroup raw_structs Exported structures for the raw, unparsed records metadata and data
      @{
      */
-    
-    /**
-     @brief Parsed data from HUFF and CDIC records needed to unpack huffman compressed text
-     */
-    typedef struct {
-        size_t index_count; /**< Total number of indices in all CDIC records, stored in each CDIC record header */
-        size_t index_read; /**< Number of indices parsed, used by parser */
-        size_t code_length; /**< Code length value stored in CDIC record header */
-        uint32_t table1[256]; /**< Table of big-endian indices from HUFF record data1 */
-        uint32_t mincode_table[33]; /**< Table of big-endian mincodes from HUFF record data2 */
-        uint32_t maxcode_table[33]; /**< Table of big-endian maxcodes from HUFF record data2 */
-        uint16_t *symbol_offsets; /**< Index of symbol offsets parsed from CDIC records (index_count entries) */
-        unsigned char **symbols; /**< Array of pointers to start of symbols data in each CDIC record (index = number of CDIC record) */
-    } MOBIHuffCdic;
 
     /**
      @brief Header of palmdoc database file
@@ -280,7 +292,7 @@ extern "C"
         char mobi_magic[5]; /**< 16: M O B I { 77, 79, 66, 73 }, zero terminated */
         uint32_t *header_length; /**< 20: the length of the MOBI header, including the previous 4 bytes */
         uint32_t *mobi_type; /**< 24: mobipocket file type */
-        uint32_t *text_encoding; /**< 28: 1252 = CP1252, 65001 = UTF-8 */
+        MOBIEncoding *text_encoding; /**< 28: 1252 = CP1252, 65001 = UTF-8 */
         uint32_t *uid; /**< 32: unique id */
         uint32_t *version; /**< 36: mobipocket format */
         uint32_t *orth_index; /**< 40: section number of orthographic meta index. MOBI_NOTSET if index is not available. */
@@ -348,6 +360,7 @@ extern "C"
         uint32_t *unknown18; /**< 268: */
         uint32_t *unknown19; /**< 272: */
         uint32_t *unknown20; /**< 276: */
+        char *full_name; /**< variable offset (full_name_offset): full name */
     } MOBIMobiHeader;
 
     /**
@@ -360,6 +373,7 @@ extern "C"
     typedef struct MOBIData {
         bool use_kf8; /**< Flag: if set to true (default), KF8 part of hybrid file is parsed, if false - KF7 part will be parsed */
         uint32_t kf8_boundary_offset; /**< Set to KF8 boundary rec number if present, otherwise: MOBI_NOTSET */
+        unsigned char *drm_key; /**< key for decryption, NULL if not set */
         MOBIPdbHeader *ph; /**< Palmdoc database header structure or NULL if not loaded */
         MOBIRecord0Header *rh; /**< Record0 header structure or NULL if not loaded */
         MOBIMobiHeader *mh; /**< MOBI header structure or NULL if not loaded */
@@ -386,12 +400,6 @@ extern "C"
         uint32_t *fdst_section_starts; /**< Array of section start offsets */
         uint32_t *fdst_section_ends; /**< Array of section end offsets */
     } MOBIFdst;
-
-    /**
-     @brief Maximum value of tag values in index entry (MOBIIndexTag) 
-     FIXME: is 2 enough?
-     */
-#define MOBI_INDX_MAXTAGVALUES 2
     
     /**
      @brief Parsed tag for an index entry
@@ -399,7 +407,7 @@ extern "C"
     typedef struct {
         size_t tagid; /**< Tag id */
         size_t tagvalues_count; /**< Number of tag values */
-        uint32_t tagvalues[MOBI_INDX_MAXTAGVALUES]; /**< Array of tag values */
+        uint32_t *tagvalues; /**< Array of tag values */
     } MOBIIndexTag;
 
     /**
@@ -417,14 +425,15 @@ extern "C"
     typedef struct {
         size_t type; /**< Index type: 0 - normal, 2 - inflection */
         size_t entries_count; /**< Index entries count */
-        size_t encoding; /**< Index encoding */
+        MOBIEncoding encoding; /**< Index encoding */
         size_t total_entries_count; /**< Total index entries count */
         size_t ordt_offset; /**< ORDT offset */
         size_t ligt_offset; /**< LIGT offset */
-        size_t ordt_entries_count; /**< ORDT index entries count */
+        size_t ligt_entries_count; /**< LIGT index entries count */
         size_t cncx_records_count; /**< Number of compiled NCX records */
         MOBIPdbRecord *cncx_record; /**< Link to CNCX record */
         MOBIIndexEntry *entries; /**< Index entries array */
+        char *orth_index_name; /**< Orth index name */
     } MOBIIndx;
     
     /**
@@ -451,6 +460,7 @@ extern "C"
         MOBIIndx *guide; /**< Parsed guide index or NULL if not present */
         MOBIIndx *ncx; /**< Parsed NCX index or NULL if not present */
         MOBIIndx *orth; /**< Parsed orth index or NULL if not present */
+        MOBIIndx *infl; /**< Parsed infl index or NULL if not present */
         MOBIPart *flow; /**< Linked list of reconstructed main flow parts or NULL if not present */
         MOBIPart *markup; /**< Linked list of reconstructed markup files or NULL if not present */
         MOBIPart *resources; /**< Linked list of reconstructed resources files or NULL if not present */
@@ -466,31 +476,44 @@ extern "C"
     MOBI_EXPORT MOBI_RET mobi_load_file(MOBIData *m, FILE *file);
     MOBI_EXPORT MOBI_RET mobi_load_filename(MOBIData *m, const char *path);
     
-    MOBI_EXPORT MOBIData * mobi_init();
+    MOBI_EXPORT MOBIData * mobi_init(void);
     MOBI_EXPORT void mobi_free(MOBIData *m);
     
     MOBI_EXPORT MOBI_RET mobi_parse_kf7(MOBIData *m);
     MOBI_EXPORT MOBI_RET mobi_parse_kf8(MOBIData *m);
     
-    MOBI_EXPORT MOBI_RET mobi_parse_huffdic(const MOBIData *m, MOBIHuffCdic *cdic);
-    MOBI_EXPORT MOBI_RET mobi_parse_fdst(const MOBIData *m, MOBIRawml *rawml);
-    MOBI_EXPORT MOBI_RET mobi_parse_index(const MOBIData *m, MOBIIndx *indx, const size_t indx_record_number);
     MOBI_EXPORT MOBI_RET mobi_parse_rawml(MOBIRawml *rawml, const MOBIData *m);
+    MOBI_EXPORT MOBI_RET mobi_parse_rawml_opt(MOBIRawml *rawml, const MOBIData *m, bool parse_toc, bool parse_dict, bool reconstruct);
+
     MOBI_EXPORT MOBI_RET mobi_get_rawml(const MOBIData *m, char *text, size_t *len);
     MOBI_EXPORT MOBI_RET mobi_dump_rawml(const MOBIData *m, FILE *file);
     MOBI_EXPORT MOBI_RET mobi_decode_font_resource(unsigned char **decoded_font, size_t *decoded_size, MOBIPart *part);
     MOBI_EXPORT MOBI_RET mobi_decode_audio_resource(unsigned char **decoded_resource, size_t *decoded_size, MOBIPart *part);
     MOBI_EXPORT MOBI_RET mobi_decode_video_resource(unsigned char **decoded_resource, size_t *decoded_size, MOBIPart *part);
+    MOBI_EXPORT MOBI_RET mobi_get_embedded_source(unsigned char **data, size_t *size, const MOBIData *m);
+    MOBI_EXPORT MOBI_RET mobi_get_embedded_log(unsigned char **data, size_t *size, const MOBIData *m);
     
     MOBI_EXPORT MOBIPdbRecord * mobi_get_record_by_uid(const MOBIData *m, const size_t uid);
     MOBI_EXPORT MOBIPdbRecord * mobi_get_record_by_seqnumber(const MOBIData *m, const size_t uid);
+    MOBI_EXPORT MOBIPart * mobi_get_flow_by_uid(const MOBIRawml *rawml, const size_t uid);
+    MOBI_EXPORT MOBIPart * mobi_get_flow_by_fid(const MOBIRawml *rawml, const char *fid);
+    MOBI_EXPORT MOBIPart * mobi_get_resource_by_uid(const MOBIRawml *rawml, const size_t uid);
+    MOBI_EXPORT MOBIPart * mobi_get_resource_by_fid(const MOBIRawml *rawml, const char *fid);
+    MOBI_EXPORT MOBIPart * mobi_get_part_by_uid(const MOBIRawml *rawml, const size_t uid);
     MOBI_EXPORT MOBI_RET mobi_get_fullname(const MOBIData *m, char *fullname, const size_t len);
+    MOBI_EXPORT size_t mobi_get_first_resource_record(const MOBIData *m);
     MOBI_EXPORT size_t mobi_get_text_maxsize(const MOBIData *m);
+    MOBI_EXPORT uint16_t mobi_get_textrecord_maxsize(const MOBIData *m);
     MOBI_EXPORT size_t mobi_get_kf8offset(const MOBIData *m);
     MOBI_EXPORT size_t mobi_get_kf8boundary_seqnumber(const MOBIData *m);
     MOBI_EXPORT size_t mobi_get_record_extrasize(const MOBIPdbRecord *record, const uint16_t flags);
+    MOBI_EXPORT size_t mobi_get_record_mb_extrasize(const MOBIPdbRecord *record, const uint16_t flags);
     MOBI_EXPORT size_t mobi_get_fileversion(const MOBIData *m);
     MOBI_EXPORT size_t mobi_get_fdst_record_number(const MOBIData *m);
+    MOBI_EXPORT MOBIExthHeader * mobi_get_exthrecord_by_tag(const MOBIData *m, const MOBIExthTag tag);
+    MOBI_EXPORT MOBIExthHeader * mobi_next_exthrecord_by_tag(const MOBIData *m, const MOBIExthTag tag, MOBIExthHeader **start);
+    MOBI_EXPORT MOBI_RET mobi_delete_exthrecord_by_tag(MOBIData *m, const MOBIExthTag tag);
+    MOBI_EXPORT MOBI_RET mobi_add_exthrecord(MOBIData *m, const MOBIExthTag tag, const uint32_t size, const void *value);
     MOBI_EXPORT MOBIExthMeta mobi_get_exthtagmeta_by_tag(const MOBIExthTag tag);
     MOBI_EXPORT MOBIFileMeta mobi_get_filemeta_by_type(const MOBIFiletype type);
     MOBI_EXPORT uint32_t mobi_decode_exthvalue(const unsigned char *data, const size_t size);
@@ -506,13 +529,75 @@ extern "C"
     MOBI_EXPORT bool mobi_exists_guide_indx(const MOBIData *m);
     MOBI_EXPORT bool mobi_exists_ncx(const MOBIData *m);
     MOBI_EXPORT bool mobi_exists_orth(const MOBIData *m);
+    MOBI_EXPORT bool mobi_exists_infl(const MOBIData *m);
     MOBI_EXPORT bool mobi_is_hybrid(const MOBIData *m);
     MOBI_EXPORT bool mobi_is_encrypted(const MOBIData *m);
     MOBI_EXPORT bool mobi_is_mobipocket(const MOBIData *m);
-    
+    MOBI_EXPORT bool mobi_is_dictionary(const MOBIData *m);
+    MOBI_EXPORT bool mobi_is_kf8(const MOBIData *m);
+    MOBI_EXPORT bool mobi_is_rawml_kf8(const MOBIRawml *rawml);
     MOBI_EXPORT MOBIRawml * mobi_init_rawml(const MOBIData *m);
     MOBI_EXPORT void mobi_free_rawml(MOBIRawml *rawml);
     
+    MOBI_EXPORT char * mobi_meta_get_title(const MOBIData *m);
+    MOBI_EXPORT char * mobi_meta_get_author(const MOBIData *m);
+    MOBI_EXPORT char * mobi_meta_get_publisher(const MOBIData *m);
+    MOBI_EXPORT char * mobi_meta_get_imprint(const MOBIData *m);
+    MOBI_EXPORT char * mobi_meta_get_description(const MOBIData *m);
+    MOBI_EXPORT char * mobi_meta_get_isbn(const MOBIData *m);
+    MOBI_EXPORT char * mobi_meta_get_subject(const MOBIData *m);
+    MOBI_EXPORT char * mobi_meta_get_publishdate(const MOBIData *m);
+    MOBI_EXPORT char * mobi_meta_get_review(const MOBIData *m);
+    MOBI_EXPORT char * mobi_meta_get_contributor(const MOBIData *m);
+    MOBI_EXPORT char * mobi_meta_get_copyright(const MOBIData *m);
+    MOBI_EXPORT char * mobi_meta_get_asin(const MOBIData *m);
+    MOBI_EXPORT char * mobi_meta_get_language(const MOBIData *m);
+    MOBI_EXPORT MOBI_RET mobi_meta_set_title(MOBIData *m, const char *title);
+    MOBI_EXPORT MOBI_RET mobi_meta_add_title(MOBIData *m, const char *title);
+    MOBI_EXPORT MOBI_RET mobi_meta_delete_title(MOBIData *m);
+    MOBI_EXPORT MOBI_RET mobi_meta_set_author(MOBIData *m, const char *author);
+    MOBI_EXPORT MOBI_RET mobi_meta_add_author(MOBIData *m, const char *author);
+    MOBI_EXPORT MOBI_RET mobi_meta_delete_author(MOBIData *m);
+    MOBI_EXPORT MOBI_RET mobi_meta_set_publisher(MOBIData *m, const char *publisher);
+    MOBI_EXPORT MOBI_RET mobi_meta_add_publisher(MOBIData *m, const char *publisher);
+    MOBI_EXPORT MOBI_RET mobi_meta_delete_publisher(MOBIData *m);
+    MOBI_EXPORT MOBI_RET mobi_meta_set_imprint(MOBIData *m, const char *imprint);
+    MOBI_EXPORT MOBI_RET mobi_meta_add_imprint(MOBIData *m, const char *imprint);
+    MOBI_EXPORT MOBI_RET mobi_meta_delete_imprint(MOBIData *m);
+    MOBI_EXPORT MOBI_RET mobi_meta_set_description(MOBIData *m, const char *description);
+    MOBI_EXPORT MOBI_RET mobi_meta_add_description(MOBIData *m, const char *description);
+    MOBI_EXPORT MOBI_RET mobi_meta_delete_description(MOBIData *m);
+    MOBI_EXPORT MOBI_RET mobi_meta_set_isbn(MOBIData *m, const char *isbn);
+    MOBI_EXPORT MOBI_RET mobi_meta_add_isbn(MOBIData *m, const char *isbn);
+    MOBI_EXPORT MOBI_RET mobi_meta_delete_isbn(MOBIData *m);
+    MOBI_EXPORT MOBI_RET mobi_meta_set_subject(MOBIData *m, const char *subject);
+    MOBI_EXPORT MOBI_RET mobi_meta_add_subject(MOBIData *m, const char *subject);
+    MOBI_EXPORT MOBI_RET mobi_meta_delete_subject(MOBIData *m);
+    MOBI_EXPORT MOBI_RET mobi_meta_set_publishdate(MOBIData *m, const char *publishdate);
+    MOBI_EXPORT MOBI_RET mobi_meta_add_publishdate(MOBIData *m, const char *publishdate);
+    MOBI_EXPORT MOBI_RET mobi_meta_delete_publishdate(MOBIData *m);
+    MOBI_EXPORT MOBI_RET mobi_meta_set_review(MOBIData *m, const char *review);
+    MOBI_EXPORT MOBI_RET mobi_meta_add_review(MOBIData *m, const char *review);
+    MOBI_EXPORT MOBI_RET mobi_meta_delete_review(MOBIData *m);
+    MOBI_EXPORT MOBI_RET mobi_meta_set_contributor(MOBIData *m, const char *contributor);
+    MOBI_EXPORT MOBI_RET mobi_meta_add_contributor(MOBIData *m, const char *contributor);
+    MOBI_EXPORT MOBI_RET mobi_meta_delete_contributor(MOBIData *m);
+    MOBI_EXPORT MOBI_RET mobi_meta_set_copyright(MOBIData *m, const char *copyright);
+    MOBI_EXPORT MOBI_RET mobi_meta_add_copyright(MOBIData *m, const char *copyright);
+    MOBI_EXPORT MOBI_RET mobi_meta_delete_copyright(MOBIData *m);
+    MOBI_EXPORT MOBI_RET mobi_meta_set_asin(MOBIData *m, const char *asin);
+    MOBI_EXPORT MOBI_RET mobi_meta_add_asin(MOBIData *m, const char *asin);
+    MOBI_EXPORT MOBI_RET mobi_meta_delete_asin(MOBIData *m);
+    MOBI_EXPORT MOBI_RET mobi_meta_set_language(MOBIData *m, const char *language);
+    MOBI_EXPORT MOBI_RET mobi_meta_add_language(MOBIData *m, const char *language);
+    MOBI_EXPORT MOBI_RET mobi_meta_delete_language(MOBIData *m);
+    
+    MOBI_EXPORT MOBI_RET mobi_drm_setkey(MOBIData *m, const char *pid);
+    MOBI_EXPORT MOBI_RET mobi_drm_setkey_serial(MOBIData *m, const char *serial);
+    MOBI_EXPORT MOBI_RET mobi_drm_delkey(MOBIData *m);
+    MOBI_EXPORT MOBI_RET mobi_drm_decrypt(MOBIData *m);
+    
+    MOBI_EXPORT MOBI_RET mobi_write_file(FILE *file, MOBIData *m);
     /** @} */ // end of mobi_export group
     
 #ifdef __cplusplus
